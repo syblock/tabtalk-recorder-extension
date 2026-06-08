@@ -163,21 +163,29 @@ function toBooleanSetting(value, fallback = false) {
 }
 
 async function storageBridgeGet(keys) {
-  if (chrome?.storage?.local) {
-    return chrome.storage.local.get(keys);
+  // chrome.storage.local is available in offscreen documents (storage permission, Chrome 116+)
+  try {
+    return await chrome.storage.local.get(keys);
+  } catch (_directError) {
+    // fall through to service worker bridge
   }
 
-  const response = await chrome.runtime.sendMessage({
-    type: "storage-get",
-    target: "service-worker-storage",
-    keys,
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: "storage-get", target: "service-worker-storage", keys },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "storage-get bridge failed"));
+          return;
+        }
+        if (!response?.success) {
+          reject(new Error(response?.error || "storage-get bridge failed"));
+          return;
+        }
+        resolve(response.data || {});
+      },
+    );
   });
-
-  if (!response?.success) {
-    throw new Error(response?.error || "storage-get bridge failed");
-  }
-
-  return response.data || {};
 }
 
 async function waitForStorageUtils(maxAttempts = 100, delayMs = 50) {
@@ -339,10 +347,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         (async () => {
           try {
             console.log("Finalizing incomplete recording:", message.data);
-            currentRecordingId = message.data.recordingId;
+            const recordingId = message.data?.recordingId;
+            if (!recordingId) {
+              console.warn("finalize-incomplete: no valid recordingId, skipping");
+              sendResponse({ success: false, error: "No valid recordingId" });
+              return;
+            }
+            currentRecordingId = recordingId;
             recordingStartTime = message.data.recordingStartTime;
 
-            // Set sample rate and channels (use defaults if not provided)
+            // Set sample rate and channels (use values stored during recording)
             sampleRate = message.data.sampleRate || 48000;
             numberOfChannels = message.data.numberOfChannels || 1;
 
@@ -588,13 +602,15 @@ async function startRecording(streamId) {
       numberOfChannels,
     });
 
-    // Store recording state
+    // Store recording state (including sampleRate for crash recovery)
     chrome.runtime.sendMessage({
       type: "set-recording-state",
       target: "service-worker",
       data: {
         recordingStartTime: recordingStartTime,
         activeRecordingId: currentRecordingId,
+        sampleRate: sampleRate,
+        numberOfChannels: numberOfChannels,
       },
     });
 
@@ -692,6 +708,15 @@ async function stopAllStreams() {
 
 // Save PCM chunk for crash recovery (incremental, concatenatable)
 async function savePcmChunk() {
+  // Capture recording context immediately to avoid race with cleanup()
+  const recordingId = currentRecordingId;
+  const chunkSampleRate = sampleRate;
+  const chunkChannels = numberOfChannels;
+
+  if (!recordingId) {
+    return;
+  }
+
   // Skip when no PCM frames were captured yet (e.g. recovery/fresh start)
   if (!pcmChunkAccumulator.hasAny()) {
     return;
@@ -710,8 +735,13 @@ async function savePcmChunk() {
     const totalLength = int16Array.length;
     const pcmChunkBuffer = int16Array.buffer.slice(0);
 
-    const chunkNumber = await getNextChunkNumber();
+    const chunkNumber = await getNextChunkNumber(recordingId);
     const chunkTimestamp = Date.now();
+
+    // Abort if recording was stopped while we were awaiting
+    if (!currentRecordingId) {
+      return;
+    }
 
     console.log(
       `Saving PCM chunk ${chunkNumber} (${((totalLength * 2) / 1024).toFixed(2)} KB, ${newChunksCount} buffers)`,
@@ -719,16 +749,16 @@ async function savePcmChunk() {
 
     const storageUtils = await waitForStorageUtils();
 
-    const chunkKey = `${currentRecordingId}-chunk-${chunkNumber}`;
+    const chunkKey = `${recordingId}-chunk-${chunkNumber}`;
     await storageUtils.saveRecording(pcmChunkBuffer, {
       key: chunkKey,
       source: "recording-chunk",
-      parentRecordingId: currentRecordingId,
+      parentRecordingId: recordingId,
       chunkNumber: chunkNumber,
       chunkSize: totalLength * 2, // Int16 = 2 bytes per sample
       chunkTimestamp: chunkTimestamp,
-      sampleRate: sampleRate,
-      numberOfChannels: numberOfChannels,
+      sampleRate: chunkSampleRate,
+      numberOfChannels: chunkChannels,
       samplesCount: totalLength,
       format: "pcm-int16",
     });
@@ -740,14 +770,14 @@ async function savePcmChunk() {
   }
 }
 
-async function getNextChunkNumber() {
+async function getNextChunkNumber(recordingId) {
   try {
     const storageUtils = await waitForStorageUtils();
     const allRecordings = await storageUtils.getAllRecordings();
     const chunks = allRecordings.filter(
       (r) =>
         r.source === "recording-chunk" &&
-        r.parentRecordingId === currentRecordingId,
+        r.parentRecordingId === recordingId,
     );
 
     return chunks.length;
@@ -758,6 +788,17 @@ async function getNextChunkNumber() {
 }
 
 async function finalizeRecording() {
+  // Capture context immediately to avoid race with cleanup()
+  const recordingId = currentRecordingId;
+  const finalizeSampleRate = sampleRate;
+  const finalizeChannels = numberOfChannels;
+  const finalizeStartTime = recordingStartTime;
+
+  if (!recordingId) {
+    console.error("finalizeRecording: currentRecordingId is null, cannot finalize");
+    return;
+  }
+
   try {
     console.log("Finalizing recording...");
 
@@ -772,7 +813,7 @@ async function finalizeRecording() {
       .filter(
         (r) =>
           r.source === "recording-chunk" &&
-          r.parentRecordingId === currentRecordingId,
+          r.parentRecordingId === recordingId,
       )
       .sort((a, b) => a.chunkNumber - b.chunkNumber);
 
@@ -783,16 +824,20 @@ async function finalizeRecording() {
       return;
     }
 
+    // Use sampleRate from chunk metadata as source of truth (most accurate)
+    const actualSampleRate = chunks[0]?.sampleRate || finalizeSampleRate;
+    const actualChannels = chunks[0]?.numberOfChannels || finalizeChannels;
+
     // Calculate total size and duration
     const totalSamples = chunks.reduce(
       (sum, chunk) => sum + (chunk.samplesCount || 0),
       0,
     );
     const totalSize = totalSamples * 2; // Int16 = 2 bytes per sample
-    const estimatedDuration = Math.floor(totalSamples / sampleRate);
+    const estimatedDuration = Math.floor(totalSamples / actualSampleRate);
 
     console.log(
-      `PCM recording: ${chunks.length} chunks, ${totalSamples} samples, ${estimatedDuration}s`,
+      `PCM recording: ${chunks.length} chunks, ${totalSamples} samples, ${estimatedDuration}s @ ${actualSampleRate}Hz`,
     );
 
     // Build optional preview/download media payload (audio-only or tab video WebM)
@@ -810,11 +855,11 @@ async function finalizeRecording() {
     );
     await dbModule.init();
 
-    await dbModule.saveRecording(currentRecordingId, {
-      key: currentRecordingId,
+    await dbModule.saveRecording(recordingId, {
+      key: recordingId,
       data: mediaPayload,
       source: "recording",
-      timestamp: recordingStartTime,
+      timestamp: finalizeStartTime,
       duration: estimatedDuration,
       fileSize: mediaBlobSize || totalSize,
       chunksCount: chunks.length,
@@ -822,21 +867,20 @@ async function finalizeRecording() {
       isPcm: true, // Flag to indicate PCM chunks
       hasVideo: isRecordingVideo,
       mimeType: recordingMimeType,
-      sampleRate: sampleRate,
-      numberOfChannels: numberOfChannels,
+      sampleRate: actualSampleRate,
+      numberOfChannels: actualChannels,
       totalSamples: totalSamples,
     });
 
-    const savedRecordingKey = currentRecordingId;
     console.log(
       `✓ Final recording saved: ${chunks.length} PCM chunks, ${estimatedDuration}s, ${(totalSize / 1024 / 1024).toFixed(2)} MB`,
     );
     console.log(
-      `✓ Recording saved with key: ${savedRecordingKey}, isPcm: true, sampleRate: ${sampleRate} Hz`,
+      `✓ Recording saved with key: ${recordingId}, isPcm: true, sampleRate: ${actualSampleRate} Hz`,
     );
 
     // Fire-and-forget auto transcription so recording stop UX is not blocked by API calls
-    runAutoTranscriptionIfEnabled(savedRecordingKey);
+    runAutoTranscriptionIfEnabled(recordingId);
   } catch (error) {
     console.error("❌ Error finalizing recording:", error);
     console.error("Stack trace:", error.stack);

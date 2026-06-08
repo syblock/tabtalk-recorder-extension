@@ -52,9 +52,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Helper function to check and finalize incomplete recordings
 async function checkAndFinalizeIncompleteRecordings() {
   try {
-    const { activeRecordingId, recordingStartTime } = await chrome.storage.local.get([
+    const { activeRecordingId, recordingStartTime, recordingSampleRate, recordingNumberOfChannels } = await chrome.storage.local.get([
       'activeRecordingId',
-      'recordingStartTime'
+      'recordingStartTime',
+      'recordingSampleRate',
+      'recordingNumberOfChannels'
     ]);
 
     if (activeRecordingId && recordingStartTime) {
@@ -84,7 +86,9 @@ async function checkAndFinalizeIncompleteRecordings() {
         target: 'offscreen',
         data: {
           recordingId: activeRecordingId,
-          recordingStartTime: recordingStartTime
+          recordingStartTime: recordingStartTime,
+          sampleRate: recordingSampleRate || 48000,
+          numberOfChannels: recordingNumberOfChannels || 1
         }
       }, (response) => {
         if (chrome.runtime.lastError) {
@@ -240,11 +244,13 @@ chrome.runtime.onMessage.addListener(async (message) => {
         break;
 
       case "set-recording-state":
-        // Store recording state in chrome.storage
+        // Store recording state in chrome.storage (including sampleRate for crash recovery)
         console.log('Setting recording state:', message.data);
         chrome.storage.local.set({
           recordingStartTime: message.data.recordingStartTime,
-          activeRecordingId: message.data.activeRecordingId
+          activeRecordingId: message.data.activeRecordingId,
+          recordingSampleRate: message.data.sampleRate,
+          recordingNumberOfChannels: message.data.numberOfChannels
         }, () => {
           console.log('Recording state saved to chrome.storage');
         });
@@ -253,7 +259,7 @@ chrome.runtime.onMessage.addListener(async (message) => {
       case "clear-recording-state":
         // Clear recording state from chrome.storage
         console.log('Clearing recording state');
-        chrome.storage.local.remove(['activeRecordingId', 'recordingStartTime'], () => {
+        chrome.storage.local.remove(['activeRecordingId', 'recordingStartTime', 'recordingSampleRate', 'recordingNumberOfChannels'], () => {
           console.log('Recording state cleared from chrome.storage');
         });
         break;

@@ -888,9 +888,12 @@ async function loadHistory(skipRecovery = false) {
     }
   }
 
-  // Group chunks by parent recording ID
+  // Group chunks by parent recording ID (skip orphaned chunks with null/invalid parentId)
   const chunksByParent = {};
   for (const chunk of chunks) {
+    if (!chunk.parentRecordingId || !String(chunk.parentRecordingId).startsWith("recording-")) {
+      continue;
+    }
     if (!chunksByParent[chunk.parentRecordingId]) {
       chunksByParent[chunk.parentRecordingId] = [];
     }
@@ -1945,10 +1948,10 @@ historyList.addEventListener("click", async (e) => {
       // Delete the main recording
       await window.StorageUtils.deleteRecording(key);
 
-      // Also delete all associated chunks
+      // Also delete all associated chunks (compare both as string to handle null/string mismatch)
       const allRecordings = await window.StorageUtils.getAllRecordings();
       const chunks = allRecordings.filter(
-        (r) => r.source === "recording-chunk" && r.parentRecordingId === key,
+        (r) => r.source === "recording-chunk" && String(r.parentRecordingId) === String(key),
       );
 
       for (const chunk of chunks) {
@@ -2214,9 +2217,12 @@ async function recoverIncompleteRecordings(recordings, chunks) {
     // Find all parent recording IDs
     const finalRecordingIds = new Set(recordings.map((r) => r.key));
 
-    // Group chunks by parent recording ID
+    // Group chunks by parent recording ID (skip orphaned chunks with null/invalid parentId)
     const chunksByParent = {};
     for (const chunk of chunks) {
+      if (!chunk.parentRecordingId || !String(chunk.parentRecordingId).startsWith("recording-")) {
+        continue;
+      }
       if (!chunksByParent[chunk.parentRecordingId]) {
         chunksByParent[chunk.parentRecordingId] = [];
       }
@@ -2227,6 +2233,11 @@ async function recoverIncompleteRecordings(recordings, chunks) {
 
     // Find incomplete recordings (have chunks but no final recording)
     for (const [parentId, parentChunks] of Object.entries(chunksByParent)) {
+      // Skip orphaned chunks with null/invalid parentId (from race condition)
+      if (!parentId || !parentId.startsWith("recording-")) {
+        console.warn(`Skipping orphaned chunks with invalid parentId: "${parentId}"`);
+        continue;
+      }
       if (!finalRecordingIds.has(parentId)) {
         console.log(
           `Recovering incomplete recording ${parentId} (${parentChunks.length} chunks)...`,

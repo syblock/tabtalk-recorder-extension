@@ -48,12 +48,16 @@ const elements = {
 
   // Transcription
   autoTranscribe: document.getElementById('autoTranscribe'),
+  transcriptionChunkIntervalSeconds: document.getElementById('transcriptionChunkIntervalSeconds'),
+  geminiTranscriptionMaxOutputTokens: document.getElementById('geminiTranscriptionMaxOutputTokens'),
 
   // Audio
   tabGain: document.getElementById('tabGain'),
   tabGainValue: document.getElementById('tabGainValue'),
   micGain: document.getElementById('micGain'),
   micGainValue: document.getElementById('micGainValue'),
+  enableMicrophoneCapture: document.getElementById('enableMicrophoneCapture'),
+  enableTabVideoCapture: document.getElementById('enableTabVideoCapture'),
   audioQuality: document.getElementById('audioQuality'),
   qualityDescription: document.getElementById('qualityDescription'),
 
@@ -99,11 +103,16 @@ async function loadSettings() {
     }
 
     // Apply settings to UI
+    const transcriptionChunkIntervalMs = Number(currentConfig.transcriptionChunkIntervalMs) || 60000;
     elements.autoTranscribe.checked = currentConfig.autoTranscribe || false;
+    elements.transcriptionChunkIntervalSeconds.value = Math.max(15, Math.round(transcriptionChunkIntervalMs / 1000));
+    elements.geminiTranscriptionMaxOutputTokens.value = Number(currentConfig.geminiTranscriptionMaxOutputTokens) || 16384;
     elements.tabGain.value = currentConfig.tabGain || 1.0;
     elements.tabGainValue.textContent = `${currentConfig.tabGain || 1.0}x`;
     elements.micGain.value = currentConfig.micGain || 1.5;
     elements.micGainValue.textContent = `${currentConfig.micGain || 1.5}x`;
+    elements.enableMicrophoneCapture.checked = currentConfig.enableMicrophoneCapture !== false;
+    elements.enableTabVideoCapture.checked = currentConfig.enableTabVideoCapture === true;
     elements.audioQuality.value = currentConfig.audioQuality || 48000;
     updateQualityDescription();
     elements.maxRecordings.value = currentConfig.maxRecordings || 50;
@@ -152,6 +161,10 @@ function setupEventListeners() {
 
   // Other inputs
   elements.autoTranscribe.addEventListener('change', () => unsavedChanges = true);
+  elements.transcriptionChunkIntervalSeconds.addEventListener('change', () => unsavedChanges = true);
+  elements.geminiTranscriptionMaxOutputTokens.addEventListener('change', () => unsavedChanges = true);
+  elements.enableMicrophoneCapture.addEventListener('change', () => unsavedChanges = true);
+  elements.enableTabVideoCapture.addEventListener('change', () => unsavedChanges = true);
   elements.maxRecordings.addEventListener('change', () => unsavedChanges = true);
   elements.showNotifications.addEventListener('change', () => unsavedChanges = true);
 
@@ -297,6 +310,22 @@ function updateQualityDescription() {
 // Save all settings
 async function saveAllSettings() {
   try {
+    const transcriptionChunkIntervalSeconds = clampInteger(
+      parseInt(elements.transcriptionChunkIntervalSeconds.value, 10),
+      15,
+      600,
+      60
+    );
+    const geminiTranscriptionMaxOutputTokens = clampInteger(
+      parseInt(elements.geminiTranscriptionMaxOutputTokens.value, 10),
+      1024,
+      65536,
+      16384
+    );
+
+    elements.transcriptionChunkIntervalSeconds.value = transcriptionChunkIntervalSeconds;
+    elements.geminiTranscriptionMaxOutputTokens.value = geminiTranscriptionMaxOutputTokens;
+
     // Save transcription model
     await chrome.storage.local.set({
       gemini_model: elements.modelSelect.value
@@ -305,8 +334,12 @@ async function saveAllSettings() {
     // Save config
     await configManager.update({
       autoTranscribe: elements.autoTranscribe.checked,
+      transcriptionChunkIntervalMs: transcriptionChunkIntervalSeconds * 1000,
+      geminiTranscriptionMaxOutputTokens,
       tabGain: parseFloat(elements.tabGain.value),
       micGain: parseFloat(elements.micGain.value),
+      enableMicrophoneCapture: elements.enableMicrophoneCapture.checked,
+      enableTabVideoCapture: elements.enableTabVideoCapture.checked,
       audioQuality: parseInt(elements.audioQuality.value),
       maxRecordings: parseInt(elements.maxRecordings.value),
       showNotifications: elements.showNotifications.checked
@@ -318,6 +351,11 @@ async function saveAllSettings() {
     console.error('Failed to save settings:', error);
     showNotification('error', 'Failed to save settings');
   }
+}
+
+function clampInteger(value, min, max, fallback) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 // Reset settings

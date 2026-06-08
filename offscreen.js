@@ -1,22 +1,337 @@
 let recorder;
-let data = [];
 let activeStreams = [];
 let recordingStartTime = null;
 let chunkSaveInterval = null;
 let currentRecordingId = null;
 let audioContext = null;
 let destination = null;
-let pcmChunks = []; // Store PCM Float32Array chunks
-let scriptProcessor = null;
-let lastSavedPcmIndex = 0; // Track which PCM chunks we've saved
+let pcmCaptureNode = null;
 let sampleRate = 48000;
 let numberOfChannels = 1;
+let autoTranscriptionTasks = new Map();
+let isRecordingVideo = false;
+let recordingMimeType = "audio/webm";
+
+class MediaRecorderChunkCollector {
+  constructor() {
+    this._chunks = [];
+  }
+
+  add(blobPart) {
+    if (blobPart?.size > 0) {
+      this._chunks.push(blobPart);
+    }
+  }
+
+  hasData() {
+    return this._chunks.length > 0;
+  }
+
+  buildBlob(mimeType) {
+    if (!this.hasData()) return null;
+    return new Blob(this._chunks, { type: mimeType || "audio/webm" });
+  }
+
+  reset() {
+    this._chunks = [];
+  }
+}
+
+class PcmChunkAccumulator {
+  constructor() {
+    this.reset();
+  }
+
+  push(chunk) {
+    if (chunk instanceof Float32Array && chunk.length > 0) {
+      this._chunks.push(chunk);
+    }
+  }
+
+  hasAny() {
+    return this._chunks.length > 0;
+  }
+
+  getPendingCount() {
+    return this._chunks.length - this._lastSavedIndex;
+  }
+
+  getPendingChunks() {
+    return this._chunks.slice(this._lastSavedIndex);
+  }
+
+  markAllSaved() {
+    this._lastSavedIndex = this._chunks.length;
+  }
+
+  toInt16Array(chunks = this.getPendingChunks()) {
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const concatenated = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      concatenated.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const int16Array = new Int16Array(totalLength);
+    for (let i = 0; i < totalLength; i++) {
+      const sample = concatenated[i];
+      const clamped = Math.max(-1, Math.min(1, sample));
+      int16Array[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    }
+
+    return int16Array;
+  }
+
+  reset() {
+    this._chunks = [];
+    this._lastSavedIndex = 0;
+  }
+}
+
+const mediaChunkCollector = new MediaRecorderChunkCollector();
+const pcmChunkAccumulator = new PcmChunkAccumulator();
 
 // Get constants from centralized config (loaded via constants.js)
 const getChunkIntervalMs = () =>
-  window.RECORDING_CONSTANTS?.TRANSCRIPTION_CHUNK_INTERVAL_MS || 60000;
+  window.RECORDING_CONSTANTS?.TRANSCRIPTION_CHUNK_INTERVAL_MS || 300000;
 const getCrashRecoveryIntervalMs = () =>
   window.RECORDING_CONSTANTS?.CRASH_RECOVERY_INTERVAL_MS || 10000;
+
+async function createPcmCaptureNode(audioContext) {
+  if (
+    typeof AudioWorkletNode === "undefined" ||
+    !audioContext?.audioWorklet?.addModule
+  ) {
+    throw new Error("AudioWorklet not supported in this context");
+  }
+
+  await audioContext.audioWorklet.addModule(
+    chrome.runtime.getURL("pcm-capture-worklet.js"),
+  );
+
+  const node = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    channelCount: 1,
+    channelCountMode: "explicit",
+  });
+
+  node.port.onmessage = (event) => {
+    if (event.data?.type !== "pcm" || !event.data.samples) return;
+
+    const { samples } = event.data;
+    if (samples instanceof Float32Array) {
+      pcmChunkAccumulator.push(samples);
+      return;
+    }
+    if (samples instanceof ArrayBuffer) {
+      pcmChunkAccumulator.push(new Float32Array(samples));
+      return;
+    }
+    if (ArrayBuffer.isView(samples)) {
+      pcmChunkAccumulator.push(new Float32Array(samples.buffer.slice(0)));
+    }
+  };
+
+  return node;
+}
+
+function toBooleanSetting(value, fallback = false) {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "true" ||
+      normalized === "1" ||
+      normalized === "yes" ||
+      normalized === "on"
+    )
+      return true;
+    if (
+      normalized === "false" ||
+      normalized === "0" ||
+      normalized === "no" ||
+      normalized === "off"
+    )
+      return false;
+  }
+  if (typeof value === "number") return value !== 0;
+  return Boolean(value);
+}
+
+async function storageBridgeGet(keys) {
+  // chrome.storage.local is available in offscreen documents (storage permission, Chrome 116+)
+  try {
+    return await chrome.storage.local.get(keys);
+  } catch (_directError) {
+    // fall through to service worker bridge
+  }
+
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: "storage-get", target: "service-worker-storage", keys },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "storage-get bridge failed"));
+          return;
+        }
+        if (!response?.success) {
+          reject(new Error(response?.error || "storage-get bridge failed"));
+          return;
+        }
+        resolve(response.data || {});
+      },
+    );
+  });
+}
+
+async function waitForStorageUtils(maxAttempts = 100, delayMs = 50) {
+  let attempts = 0;
+  while (!window.StorageUtils && attempts < maxAttempts) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    attempts++;
+  }
+
+  if (!window.StorageUtils) {
+    throw new Error("StorageUtils not available");
+  }
+
+  return window.StorageUtils;
+}
+
+function buildFinalRecordedMediaPayload() {
+  if (!isRecordingVideo || !mediaChunkCollector.hasData()) {
+    return { mediaPayload: null, mediaBlobSize: 0 };
+  }
+
+  const mediaBlob = mediaChunkCollector.buildBlob(recordingMimeType);
+  return {
+    mediaPayload: mediaBlob,
+    mediaBlobSize: mediaBlob?.size || 0,
+  };
+}
+
+async function loadOffscreenUserConfig() {
+  const defaults =
+    typeof window !== "undefined" && window.DEFAULT_CONFIG
+      ? { ...window.DEFAULT_CONFIG }
+      : {
+          tabGain: 1.0,
+          micGain: 1.5,
+          audioQuality: 48000,
+          enableMicrophoneCapture: false,
+          enableTabVideoCapture: false,
+          autoTranscribe: false,
+          transcriptionChunkIntervalMs: 60000,
+          geminiTranscriptionMaxOutputTokens: 16384,
+        };
+
+  // Prefer direct read with literal key in offscreen context (more robust than relying on shared globals)
+  try {
+    const result = await storageBridgeGet("user_settings");
+    if (result?.user_settings && typeof result.user_settings === "object") {
+      return { ...defaults, ...result.user_settings };
+    }
+  } catch (error) {
+    console.warn(
+      "[CONFIG] Direct user_settings read failed in offscreen:",
+      error,
+    );
+  }
+
+  // Fallback to ConfigManager if available
+  try {
+    if (typeof ConfigManager !== "undefined") {
+      const configManager = new ConfigManager();
+      return await configManager.load();
+    }
+  } catch (error) {
+    console.warn("[CONFIG] ConfigManager fallback failed in offscreen:", error);
+  }
+
+  return defaults;
+}
+
+async function getOffscreenTranscriptionService() {
+  if (window.offscreenTranscriptionService) {
+    return window.offscreenTranscriptionService;
+  }
+
+  if (typeof TranscriptionServiceFactory !== "undefined") {
+    const serviceType =
+      await TranscriptionServiceFactory.getConfiguredService();
+    window.offscreenTranscriptionService =
+      TranscriptionServiceFactory.create(serviceType);
+    return window.offscreenTranscriptionService;
+  }
+
+  if (typeof GeminiTranscriptionService !== "undefined") {
+    window.offscreenTranscriptionService = new GeminiTranscriptionService();
+    return window.offscreenTranscriptionService;
+  }
+
+  throw new Error("No transcription service available in offscreen context");
+}
+
+async function runAutoTranscriptionIfEnabled(recordingKey) {
+  if (!recordingKey) return;
+  if (autoTranscriptionTasks.has(recordingKey))
+    return autoTranscriptionTasks.get(recordingKey);
+
+  const task = (async () => {
+    try {
+      const userConfig = await loadOffscreenUserConfig();
+
+      if (!toBooleanSetting(userConfig.autoTranscribe, false)) {
+        console.log("[AUTO TRANSCRIBE] Disabled in settings");
+        return;
+      }
+
+      const { gemini_api_key: apiKey } =
+        await storageBridgeGet("gemini_api_key");
+      if (!apiKey) {
+        console.warn(
+          "[AUTO TRANSCRIBE] Skipped: Gemini API key not configured",
+        );
+        return;
+      }
+
+      console.log(`[AUTO TRANSCRIBE] Starting for ${recordingKey}`);
+      const service = await getOffscreenTranscriptionService();
+      const transcriptionText = await service.transcribeChunked(recordingKey);
+
+      const storageUtils = await waitForStorageUtils();
+      await storageUtils.updateTranscription(
+        recordingKey,
+        transcriptionText,
+      );
+
+      if (typeof service.clearTranscriptionState === "function") {
+        await service.clearTranscriptionState(recordingKey);
+      }
+
+      console.log(
+        `[AUTO TRANSCRIBE] Completed for ${recordingKey} (${transcriptionText.length} chars)`,
+      );
+
+      chrome.runtime.sendMessage({
+        type: "transcription-updated",
+        target: "history",
+        data: { recordingKey },
+      });
+    } catch (error) {
+      console.error(`[AUTO TRANSCRIBE] Failed for ${recordingKey}:`, error);
+    } finally {
+      autoTranscriptionTasks.delete(recordingKey);
+    }
+  })();
+
+  autoTranscriptionTasks.set(recordingKey, task);
+  return task;
+}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.target === "offscreen") {
@@ -31,11 +346,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         // Handle incomplete recording finalization
         (async () => {
           try {
-            console.log('Finalizing incomplete recording:', message.data);
-            currentRecordingId = message.data.recordingId;
+            console.log("Finalizing incomplete recording:", message.data);
+            const recordingId = message.data?.recordingId;
+            if (!recordingId) {
+              console.warn("finalize-incomplete: no valid recordingId, skipping");
+              sendResponse({ success: false, error: "No valid recordingId" });
+              return;
+            }
+            currentRecordingId = recordingId;
             recordingStartTime = message.data.recordingStartTime;
 
-            // Set sample rate and channels (use defaults if not provided)
+            // Set sample rate and channels (use values stored during recording)
             sampleRate = message.data.sampleRate || 48000;
             numberOfChannels = message.data.numberOfChannels || 1;
 
@@ -43,10 +364,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             await finalizeRecording();
             cleanup();
 
-            console.log('Incomplete recording finalized successfully');
+            console.log("Incomplete recording finalized successfully");
             sendResponse({ success: true });
           } catch (error) {
-            console.error('Error finalizing incomplete recording:', error);
+            console.error("Error finalizing incomplete recording:", error);
             sendResponse({ success: false, error: error.message });
           }
         })();
@@ -62,40 +383,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleStorageOperation(message, sendResponse) {
   try {
-    let attempts = 0;
-    while (!window.StorageUtils && attempts < 100) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-      attempts++;
-    }
-
-    if (!window.StorageUtils) {
-      throw new Error('StorageUtils not available after waiting');
-    }
+    const storageUtils = await waitForStorageUtils();
 
     switch (message.type) {
-      case 'indexeddb-save':
-        const key = await window.StorageUtils.saveRecording(
-          message.data.audioDataUrl,
-          message.data.metadata
+      case "indexeddb-save":
+        const key = await storageUtils.saveRecording(
+          message.data.mediaPayload ?? message.data.audioDataUrl,
+          message.data.metadata,
         );
         sendResponse({ success: true, key });
         break;
 
-      case 'indexeddb-getall':
-        const recordings = await window.StorageUtils.getAllRecordings();
+      case "indexeddb-getall":
+        const recordings = await storageUtils.getAllRecordings();
         sendResponse({ success: true, recordings });
         break;
 
-      case 'indexeddb-delete':
-        await window.StorageUtils.deleteRecording(message.data.key);
+      case "indexeddb-delete":
+        await storageUtils.deleteRecording(message.data.key);
         sendResponse({ success: true });
         break;
 
       default:
-        sendResponse({ error: 'Unknown storage operation' });
+        sendResponse({ error: "Unknown storage operation" });
     }
   } catch (error) {
-    console.error('Storage operation failed:', error);
+    console.error("Storage operation failed:", error);
     sendResponse({ error: error.message });
   }
 }
@@ -108,7 +421,14 @@ async function startRecording(streamId) {
   await stopAllStreams();
 
   try {
-    // Get tab audio stream
+    // Load full config for recording/transcription settings
+    const userConfig = await loadOffscreenUserConfig();
+    const enableTabVideoCapture = toBooleanSetting(
+      userConfig.enableTabVideoCapture,
+      false,
+    );
+
+    // Capture tab once (audio + optional video)
     const tabStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
@@ -116,24 +436,48 @@ async function startRecording(streamId) {
           chromeMediaSourceId: streamId,
         },
       },
-      video: false,
+      video: enableTabVideoCapture
+        ? {
+            mandatory: {
+              chromeMediaSource: "tab",
+              chromeMediaSourceId: streamId,
+            },
+          }
+        : false,
     });
 
-    // Get microphone stream with noise cancellation
-    const micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
+    // Get microphone stream (if enabled in settings)
+    let micStream = null;
 
-    activeStreams.push(tabStream, micStream);
+    // Read per-recording toggles/settings
+    const enableMicrophoneCapture = toBooleanSetting(
+      userConfig.enableMicrophoneCapture,
+      false,
+    );
 
-    // Load user settings for audio quality and gain
-    const configManager = new ConfigManager();
-    const userConfig = await configManager.load();
+    if (enableMicrophoneCapture) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+        activeStreams.push(micStream);
+        console.log("Microphone enabled");
+      } catch (error) {
+        console.warn("Failed to get microphone stream:", error.message);
+        micStream = null;
+      }
+    } else {
+      console.log("Recording tab audio only (microphone disabled)");
+    }
+
+    activeStreams.push(tabStream);
+
+    // Get desired sample rate from already loaded config
     const desiredSampleRate = userConfig.audioQuality || 48000;
 
     // Create audio context with user-selected sample rate
@@ -141,11 +485,18 @@ async function startRecording(streamId) {
     sampleRate = audioContext.sampleRate;
     numberOfChannels = 1; // Mono for simplicity
 
-    console.log(`Audio context created with sample rate: ${sampleRate} Hz (requested: ${desiredSampleRate} Hz)`);
+    console.log(
+      `Audio context created with sample rate: ${sampleRate} Hz (requested: ${desiredSampleRate} Hz)`,
+    );
+
+    // Create audio-only view of the tab stream for the Web Audio graph
+    const tabAudioStream = new MediaStream(tabStream.getAudioTracks());
 
     // Create sources
-    const tabSource = audioContext.createMediaStreamSource(tabStream);
-    const micSource = audioContext.createMediaStreamSource(micStream);
+    const tabSource = audioContext.createMediaStreamSource(tabAudioStream);
+    const micSource = micStream
+      ? audioContext.createMediaStreamSource(micStream)
+      : null;
     destination = audioContext.createMediaStreamDestination();
 
     // Create gain nodes with user settings
@@ -160,71 +511,107 @@ async function startRecording(streamId) {
     tabGain.connect(audioContext.destination);
     tabGain.connect(destination);
 
-    // Connect mic to destination only
-    micSource.connect(micGain);
-    micGain.connect(destination);
+    // Connect mic to destination only (if mic stream exists)
+    if (micSource) {
+      micSource.connect(micGain);
+      micGain.connect(destination);
+    }
 
-    // Set up PCM capture using ScriptProcessorNode
-    // This captures raw audio data continuously without any encoding gaps
-    const bufferSize = 4096;
-    scriptProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+    // Sum tab + mic into one path for PCM capture (channel merger is not for mixing)
+    const pcmMixNode = audioContext.createGain();
+    tabGain.connect(pcmMixNode);
+    if (micSource) {
+      micGain.connect(pcmMixNode);
+    }
 
-    // Mix tab and mic into single channel for PCM capture
-    const merger = audioContext.createChannelMerger(2);
-    tabGain.connect(merger, 0, 0);
-    micGain.connect(merger, 0, 0);
+    try {
+      pcmCaptureNode = await createPcmCaptureNode(audioContext);
+      pcmMixNode.connect(pcmCaptureNode);
+      pcmCaptureNode.connect(audioContext.destination);
+    } catch (error) {
+      console.warn(
+        "AudioWorklet PCM capture unavailable, falling back to ScriptProcessorNode:",
+        error.message || error,
+      );
 
-    // Capture PCM data
-    scriptProcessor.onaudioprocess = (event) => {
-      const inputData = event.inputBuffer.getChannelData(0);
-      // Clone the data since the buffer is reused
-      const pcmData = new Float32Array(inputData);
-      pcmChunks.push(pcmData);
-    };
+      const bufferSize = 4096;
+      const fallbackProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      fallbackProcessor.onaudioprocess = (event) => {
+        const inputData = event.inputBuffer.getChannelData(0);
+        pcmChunkAccumulator.push(new Float32Array(inputData));
+      };
+      pcmCaptureNode = fallbackProcessor;
+      pcmMixNode.connect(pcmCaptureNode);
+      pcmCaptureNode.connect(audioContext.destination);
+    }
 
-    merger.connect(scriptProcessor);
-    scriptProcessor.connect(audioContext.destination);
+    // Build recording stream: mixed audio + optional tab video
+    const finalRecordingTracks = [...destination.stream.getAudioTracks()];
+    const tabVideoTrack = tabStream.getVideoTracks()[0] || null;
+    if (enableTabVideoCapture && tabVideoTrack) {
+      finalRecordingTracks.push(tabVideoTrack);
+      isRecordingVideo = true;
+      recordingMimeType =
+        (typeof MediaRecorder !== "undefined" &&
+          MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8,opus") &&
+          "video/webm;codecs=vp8,opus") ||
+        (typeof MediaRecorder !== "undefined" &&
+          MediaRecorder.isTypeSupported?.("video/webm;codecs=vp9,opus") &&
+          "video/webm;codecs=vp9,opus") ||
+        "video/webm";
+      console.log("Tab video capture enabled");
+    } else {
+      isRecordingVideo = false;
+      recordingMimeType = "audio/webm";
+      if (enableTabVideoCapture) {
+        console.warn("Tab video capture requested but no tab video track was available");
+      }
+    }
 
-    // Also set up MediaRecorder for WebM output (for playback preview)
-    recorder = new MediaRecorder(destination.stream, {
-      mimeType: "audio/webm",
+    const mediaRecorderStream = new MediaStream(finalRecordingTracks);
+
+    // Also set up MediaRecorder for preview/download output
+    recorder = new MediaRecorder(mediaRecorderStream, {
+      mimeType: recordingMimeType,
     });
 
     recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        data.push(event.data);
-      }
+      mediaChunkCollector.add(event.data);
     };
 
     recorder.onstop = async () => {
-      console.log('Recorder stopped. Finalizing...');
+      console.log("Recorder stopped. Finalizing...");
+      await stopAllStreams();
       await finalizeRecording();
       cleanup();
     };
 
-    // Start continuous recording (no stopping/restarting)
-    recorder.start(1000); // Get data every second for crash recovery
+    // Start recorder without timeslice to produce a more portable final WebM file.
+    // Crash recovery relies on PCM chunks, not MediaRecorder chunks.
+    recorder.start();
     window.location.hash = "recording";
 
     // Initialize recording session
     recordingStartTime = Date.now();
     currentRecordingId = `recording-${recordingStartTime}`;
 
-    console.log('Recording started:', {
+    console.log("Recording started:", {
       recordingStartTime,
       activeRecordingId: currentRecordingId,
       sampleRate,
-      numberOfChannels
+      numberOfChannels,
     });
 
-    // Store recording state
+    // Store recording state (including sampleRate for crash recovery)
     chrome.runtime.sendMessage({
       type: "set-recording-state",
       target: "service-worker",
       data: {
         recordingStartTime: recordingStartTime,
-        activeRecordingId: currentRecordingId
-      }
+        activeRecordingId: currentRecordingId,
+        sampleRate: sampleRate,
+        numberOfChannels: numberOfChannels,
+      },
     });
 
     // Set up periodic chunk saving (PCM data for crash recovery)
@@ -233,7 +620,7 @@ async function startRecording(streamId) {
       chunkSaveInterval = setInterval(() => {
         savePcmChunk();
       }, chunkIntervalMs);
-      console.log('PCM chunk save interval set up:', chunkIntervalMs, 'ms');
+      console.log("PCM chunk save interval set up:", chunkIntervalMs, "ms");
     }
 
     chrome.runtime.sendMessage({
@@ -241,7 +628,6 @@ async function startRecording(streamId) {
       target: "service-worker",
       recording: true,
     });
-
   } catch (error) {
     console.error("Error starting recording:", error);
     chrome.runtime.sendMessage({
@@ -255,16 +641,16 @@ async function startRecording(streamId) {
 async function stopRecording() {
   if (recorder && recorder.state === "recording") {
     recorder.stop();
+  } else {
+    await stopAllStreams();
+    window.location.hash = "";
+
+    chrome.runtime.sendMessage({
+      type: "update-icon",
+      target: "service-worker",
+      recording: false,
+    });
   }
-
-  await stopAllStreams();
-  window.location.hash = "";
-
-  chrome.runtime.sendMessage({
-    type: "update-icon",
-    target: "service-worker",
-    recording: false,
-  });
 }
 
 function cleanup() {
@@ -273,19 +659,24 @@ function cleanup() {
     chunkSaveInterval = null;
   }
 
-  if (scriptProcessor) {
-    scriptProcessor.disconnect();
-    scriptProcessor = null;
+  if (pcmCaptureNode) {
+    if (pcmCaptureNode.port) {
+      pcmCaptureNode.port.onmessage = null;
+    }
+    pcmCaptureNode.disconnect();
+    pcmCaptureNode = null;
   }
 
   recorder = undefined;
-  data = [];
-  pcmChunks = [];
-  lastSavedPcmIndex = 0;
+  mediaChunkCollector.reset();
+  pcmChunkAccumulator.reset();
   recordingStartTime = null;
   currentRecordingId = null;
   audioContext = null;
   destination = null;
+  isRecordingVideo = false;
+  recordingMimeType = "audio/webm";
+  window.location.hash = "";
 
   chrome.runtime.sendMessage({
     type: "clear-recording-state",
@@ -295,6 +686,12 @@ function cleanup() {
   chrome.runtime.sendMessage({
     type: "recording-stopped",
     target: "service-worker",
+  });
+
+  chrome.runtime.sendMessage({
+    type: "update-icon",
+    target: "service-worker",
+    recording: false,
   });
 }
 
@@ -311,166 +708,181 @@ async function stopAllStreams() {
 
 // Save PCM chunk for crash recovery (incremental, concatenatable)
 async function savePcmChunk() {
-  // Skip if pcmChunks is not initialized (recovery scenario)
-  if (!pcmChunks || pcmChunks.length === 0) {
+  // Capture recording context immediately to avoid race with cleanup()
+  const recordingId = currentRecordingId;
+  const chunkSampleRate = sampleRate;
+  const chunkChannels = numberOfChannels;
+
+  if (!recordingId) {
     return;
   }
 
-  const newChunksCount = pcmChunks.length - lastSavedPcmIndex;
+  // Skip when no PCM frames were captured yet (e.g. recovery/fresh start)
+  if (!pcmChunkAccumulator.hasAny()) {
+    return;
+  }
+
+  const newChunksCount = pcmChunkAccumulator.getPendingCount();
 
   if (newChunksCount <= 0) {
     return;
   }
 
-  const newChunks = pcmChunks.slice(lastSavedPcmIndex);
+  const newChunks = pcmChunkAccumulator.getPendingChunks();
 
   try {
-    // Concatenate PCM chunks into single Float32Array
-    const totalLength = newChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const concatenated = new Float32Array(totalLength);
-    let offset = 0;
-    for (const chunk of newChunks) {
-      concatenated.set(chunk, offset);
-      offset += chunk.length;
-    }
+    const int16Array = pcmChunkAccumulator.toInt16Array(newChunks);
+    const totalLength = int16Array.length;
+    const pcmChunkBuffer = int16Array.buffer.slice(0);
 
-    // Convert Float32 to Int16 for storage (half the size)
-    const int16Array = new Int16Array(totalLength);
-    for (let i = 0; i < totalLength; i++) {
-      const sample = concatenated[i];
-      // Clamp to [-1, 1] and convert to Int16 range
-      const clamped = Math.max(-1, Math.min(1, sample));
-      int16Array[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
-    }
-
-    // Convert to base64 for storage (process in chunks to avoid stack overflow)
-    const uint8Array = new Uint8Array(int16Array.buffer);
-    let binary = '';
-    const chunkSize = 8192; // Process 8KB at a time
-    for (let i = 0; i < uint8Array.length; i += chunkSize) {
-      const chunk = uint8Array.subarray(i, Math.min(i + chunkSize, uint8Array.length));
-      binary += String.fromCharCode.apply(null, chunk);
-    }
-    const base64 = btoa(binary);
-    const dataUrl = `data:application/octet-stream;base64,${base64}`;
-
-    const chunkNumber = await getNextChunkNumber();
+    const chunkNumber = await getNextChunkNumber(recordingId);
     const chunkTimestamp = Date.now();
 
-    console.log(`Saving PCM chunk ${chunkNumber} (${(totalLength * 2 / 1024).toFixed(2)} KB, ${newChunksCount} buffers)`);
-
-    let attempts = 0;
-    while (!window.StorageUtils && attempts < 100) {
-      await new Promise(r => setTimeout(r, 50));
-      attempts++;
+    // Abort if recording was stopped while we were awaiting
+    if (!currentRecordingId) {
+      return;
     }
 
-    if (!window.StorageUtils) {
-      throw new Error('StorageUtils not available');
-    }
+    console.log(
+      `Saving PCM chunk ${chunkNumber} (${((totalLength * 2) / 1024).toFixed(2)} KB, ${newChunksCount} buffers)`,
+    );
 
-    const chunkKey = `${currentRecordingId}-chunk-${chunkNumber}`;
-    await window.StorageUtils.saveRecording(dataUrl, {
+    const storageUtils = await waitForStorageUtils();
+
+    const chunkKey = `${recordingId}-chunk-${chunkNumber}`;
+    await storageUtils.saveRecording(pcmChunkBuffer, {
       key: chunkKey,
-      source: 'recording-chunk',
-      parentRecordingId: currentRecordingId,
+      source: "recording-chunk",
+      parentRecordingId: recordingId,
       chunkNumber: chunkNumber,
       chunkSize: totalLength * 2, // Int16 = 2 bytes per sample
       chunkTimestamp: chunkTimestamp,
-      sampleRate: sampleRate,
-      numberOfChannels: numberOfChannels,
+      sampleRate: chunkSampleRate,
+      numberOfChannels: chunkChannels,
       samplesCount: totalLength,
-      format: 'pcm-int16'
+      format: "pcm-int16",
     });
 
     console.log(`PCM chunk ${chunkNumber} saved successfully`);
-    lastSavedPcmIndex = pcmChunks.length;
-
+    pcmChunkAccumulator.markAllSaved();
   } catch (error) {
-    console.error('Failed to save PCM chunk:', error);
+    console.error("Failed to save PCM chunk:", error);
   }
 }
 
-async function getNextChunkNumber() {
+async function getNextChunkNumber(recordingId) {
   try {
-    if (!window.StorageUtils) {
-      return 0;
-    }
-
-    const allRecordings = await window.StorageUtils.getAllRecordings();
-    const chunks = allRecordings.filter(r =>
-      r.source === 'recording-chunk' &&
-      r.parentRecordingId === currentRecordingId
+    const storageUtils = await waitForStorageUtils();
+    const allRecordings = await storageUtils.getAllRecordings();
+    const chunks = allRecordings.filter(
+      (r) =>
+        r.source === "recording-chunk" &&
+        r.parentRecordingId === recordingId,
     );
 
     return chunks.length;
   } catch (error) {
-    console.error('Error getting chunk number:', error);
+    console.error("Error getting chunk number:", error);
     return 0;
   }
 }
 
 async function finalizeRecording() {
+  // Capture context immediately to avoid race with cleanup()
+  const recordingId = currentRecordingId;
+  const finalizeSampleRate = sampleRate;
+  const finalizeChannels = numberOfChannels;
+  const finalizeStartTime = recordingStartTime;
+
+  if (!recordingId) {
+    console.error("finalizeRecording: currentRecordingId is null, cannot finalize");
+    return;
+  }
+
   try {
-    console.log('Finalizing recording...');
+    console.log("Finalizing recording...");
 
     // Save any remaining PCM data
     await savePcmChunk();
 
-    let attempts = 0;
-    while (!window.StorageUtils && attempts < 100) {
-      await new Promise(r => setTimeout(r, 50));
-      attempts++;
-    }
-
-    if (!window.StorageUtils) {
-      throw new Error('StorageUtils not available');
-    }
+    const storageUtils = await waitForStorageUtils();
 
     // Get all chunks for this recording
-    const allRecordings = await window.StorageUtils.getAllRecordings();
-    const chunks = allRecordings.filter(r =>
-      r.source === 'recording-chunk' &&
-      r.parentRecordingId === currentRecordingId
-    ).sort((a, b) => a.chunkNumber - b.chunkNumber);
+    const allRecordings = await storageUtils.getAllRecordings();
+    const chunks = allRecordings
+      .filter(
+        (r) =>
+          r.source === "recording-chunk" &&
+          r.parentRecordingId === recordingId,
+      )
+      .sort((a, b) => a.chunkNumber - b.chunkNumber);
 
     console.log(`Found ${chunks.length} PCM chunks to finalize`);
 
     if (chunks.length === 0) {
-      console.error('No chunks found for recording');
+      console.error("No chunks found for recording");
       return;
     }
 
+    // Use sampleRate from chunk metadata as source of truth (most accurate)
+    const actualSampleRate = chunks[0]?.sampleRate || finalizeSampleRate;
+    const actualChannels = chunks[0]?.numberOfChannels || finalizeChannels;
+
     // Calculate total size and duration
-    const totalSamples = chunks.reduce((sum, chunk) => sum + (chunk.samplesCount || 0), 0);
+    const totalSamples = chunks.reduce(
+      (sum, chunk) => sum + (chunk.samplesCount || 0),
+      0,
+    );
     const totalSize = totalSamples * 2; // Int16 = 2 bytes per sample
-    const estimatedDuration = Math.floor(totalSamples / sampleRate);
+    const estimatedDuration = Math.floor(totalSamples / actualSampleRate);
 
-    console.log(`PCM recording: ${chunks.length} chunks, ${totalSamples} samples, ${estimatedDuration}s`);
+    console.log(
+      `PCM recording: ${chunks.length} chunks, ${totalSamples} samples, ${estimatedDuration}s @ ${actualSampleRate}Hz`,
+    );
 
-    // Save the final recording metadata (no WebM data needed, PCM chunks are used for playback)
-    const dbModule = await import('./utils/indexeddb.js').then(m => m.default);
+    // Build optional preview/download media payload (audio-only or tab video WebM)
+    let mediaPayload = null;
+    let mediaBlobSize = 0;
+    try {
+      ({ mediaPayload, mediaBlobSize } = buildFinalRecordedMediaPayload());
+    } catch (error) {
+      console.warn("Failed to build preview/download media blob:", error);
+    }
+
+    // Save the final recording metadata; keep PCM chunks for transcription/download conversion
+    const dbModule = await import("./utils/indexeddb.js").then(
+      (m) => m.default,
+    );
     await dbModule.init();
 
-    await dbModule.saveRecording(currentRecordingId, {
-      key: currentRecordingId,
-      source: 'recording',
-      timestamp: recordingStartTime,
+    await dbModule.saveRecording(recordingId, {
+      key: recordingId,
+      data: mediaPayload,
+      source: "recording",
+      timestamp: finalizeStartTime,
       duration: estimatedDuration,
-      fileSize: totalSize,
+      fileSize: mediaBlobSize || totalSize,
       chunksCount: chunks.length,
       isChunked: true,
       isPcm: true, // Flag to indicate PCM chunks
-      sampleRate: sampleRate,
-      numberOfChannels: numberOfChannels,
-      totalSamples: totalSamples
+      hasVideo: isRecordingVideo,
+      mimeType: recordingMimeType,
+      sampleRate: actualSampleRate,
+      numberOfChannels: actualChannels,
+      totalSamples: totalSamples,
     });
 
-    console.log(`✓ Final recording saved: ${chunks.length} PCM chunks, ${estimatedDuration}s, ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
-    console.log(`✓ Recording saved with key: ${currentRecordingId}, isPcm: true, sampleRate: ${sampleRate} Hz`);
+    console.log(
+      `✓ Final recording saved: ${chunks.length} PCM chunks, ${estimatedDuration}s, ${(totalSize / 1024 / 1024).toFixed(2)} MB`,
+    );
+    console.log(
+      `✓ Recording saved with key: ${recordingId}, isPcm: true, sampleRate: ${actualSampleRate} Hz`,
+    );
 
+    // Fire-and-forget auto transcription so recording stop UX is not blocked by API calls
+    runAutoTranscriptionIfEnabled(recordingId);
   } catch (error) {
-    console.error('❌ Error finalizing recording:', error);
-    console.error('Stack trace:', error.stack);
+    console.error("❌ Error finalizing recording:", error);
+    console.error("Stack trace:", error.stack);
   }
 }

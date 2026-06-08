@@ -8,10 +8,14 @@ const DEFAULT_CONFIG = {
   tabGain: 1.0,
   micGain: 1.5,
   audioQuality: 48000, // Sample rate in Hz (16000, 22050, 32000, 44100, 48000)
+  enableMicrophoneCapture: false, // Enable/disable microphone capture (default: false - tab audio only)
+  enableTabVideoCapture: false, // Enable/disable tab video capture (records video/webm alongside PCM audio chunks)
 
   // Transcription settings
   transcriptionService: 'gemini',
   autoTranscribe: false,
+  transcriptionChunkIntervalMs: 60000, // Segment duration for transcription (1 minute default)
+  geminiTranscriptionMaxOutputTokens: 16384, // Max output tokens for Gemini transcription responses
 
   // UI settings
   showNotifications: true,
@@ -37,6 +41,9 @@ class ConfigManager {
    */
   async load() {
     try {
+      // ALWAYS reset to defaults first to avoid stale data
+      this.config = { ...DEFAULT_CONFIG };
+
       // Check if chrome API is available
       if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
         // Silently use defaults - this is expected in some contexts
@@ -46,12 +53,12 @@ class ConfigManager {
 
       // Check if StorageKeys is defined
       if (typeof StorageKeys === 'undefined') {
-        console.warn('StorageKeys not defined, using defaults');
         this.loaded = true;
         return this.config;
       }
 
       const result = await chrome.storage.local.get(StorageKeys.USER_SETTINGS);
+
       if (result[StorageKeys.USER_SETTINGS]) {
         this.config = { ...DEFAULT_CONFIG, ...result[StorageKeys.USER_SETTINGS] };
       }

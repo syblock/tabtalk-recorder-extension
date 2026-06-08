@@ -13,12 +13,50 @@ chrome.runtime.onInstalled.addListener(async () => {
   await checkAndFinalizeIncompleteRecordings();
 });
 
+// Storage bridge for contexts that don't expose chrome.storage (e.g. offscreen)
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.target !== 'service-worker-storage') {
+    return false;
+  }
+
+  (async () => {
+    try {
+      switch (message.type) {
+        case 'storage-get': {
+          const data = await chrome.storage.local.get(message.keys);
+          sendResponse({ success: true, data });
+          break;
+        }
+        case 'storage-set': {
+          await chrome.storage.local.set(message.items || {});
+          sendResponse({ success: true });
+          break;
+        }
+        case 'storage-remove': {
+          await chrome.storage.local.remove(message.keys);
+          sendResponse({ success: true });
+          break;
+        }
+        default:
+          sendResponse({ success: false, error: 'Unknown storage bridge operation' });
+      }
+    } catch (error) {
+      console.error('Storage bridge error:', error);
+      sendResponse({ success: false, error: error.message });
+    }
+  })();
+
+  return true;
+});
+
 // Helper function to check and finalize incomplete recordings
 async function checkAndFinalizeIncompleteRecordings() {
   try {
-    const { activeRecordingId, recordingStartTime } = await chrome.storage.local.get([
+    const { activeRecordingId, recordingStartTime, recordingSampleRate, recordingNumberOfChannels } = await chrome.storage.local.get([
       'activeRecordingId',
-      'recordingStartTime'
+      'recordingStartTime',
+      'recordingSampleRate',
+      'recordingNumberOfChannels'
     ]);
 
     if (activeRecordingId && recordingStartTime) {
@@ -48,7 +86,9 @@ async function checkAndFinalizeIncompleteRecordings() {
         target: 'offscreen',
         data: {
           recordingId: activeRecordingId,
-          recordingStartTime: recordingStartTime
+          recordingStartTime: recordingStartTime,
+          sampleRate: recordingSampleRate || 48000,
+          numberOfChannels: recordingNumberOfChannels || 1
         }
       }, (response) => {
         if (chrome.runtime.lastError) {
@@ -183,7 +223,7 @@ chrome.runtime.onMessage.addListener(async (message) => {
               type: 'indexeddb-save',
               target: 'storage-handler',
               data: {
-                audioDataUrl: message.data,
+                mediaPayload: message.data,
                 metadata: {
                   source: 'recording'
                 }
@@ -204,11 +244,13 @@ chrome.runtime.onMessage.addListener(async (message) => {
         break;
 
       case "set-recording-state":
-        // Store recording state in chrome.storage
+        // Store recording state in chrome.storage (including sampleRate for crash recovery)
         console.log('Setting recording state:', message.data);
         chrome.storage.local.set({
           recordingStartTime: message.data.recordingStartTime,
-          activeRecordingId: message.data.activeRecordingId
+          activeRecordingId: message.data.activeRecordingId,
+          recordingSampleRate: message.data.sampleRate,
+          recordingNumberOfChannels: message.data.numberOfChannels
         }, () => {
           console.log('Recording state saved to chrome.storage');
         });
@@ -217,7 +259,7 @@ chrome.runtime.onMessage.addListener(async (message) => {
       case "clear-recording-state":
         // Clear recording state from chrome.storage
         console.log('Clearing recording state');
-        chrome.storage.local.remove(['activeRecordingId', 'recordingStartTime'], () => {
+        chrome.storage.local.remove(['activeRecordingId', 'recordingStartTime', 'recordingSampleRate', 'recordingNumberOfChannels'], () => {
           console.log('Recording state cleared from chrome.storage');
         });
         break;
